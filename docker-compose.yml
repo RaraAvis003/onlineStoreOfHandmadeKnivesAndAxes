@@ -1,0 +1,274 @@
+version: '3.8'
+
+services:
+  # PostgreSQL - Основная база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: knife-store-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-knife_store}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - knife-store-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis - Кэширование и очереди
+  redis:
+    image: redis:7-alpine
+    container_name: knife-store-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - knife-store-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO - Хранилище изображений
+  minio:
+    image: minio/minio:latest
+    container_name: knife-store-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - knife-store-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Catalog Service - Микросервис каталога товаров
+  catalog-service:
+    build:
+      context: ./services/catalog
+      dockerfile: Dockerfile
+    container_name: knife-store-catalog
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/knife_store
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./services/catalog:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - knife-store-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Order Service - Микросервис заказов
+  order-service:
+    build:
+      context: ./services/orders
+      dockerfile: Dockerfile
+    container_name: knife-store-orders
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/knife_store
+      REDIS_URL: redis://redis:6379/1
+      CATALOG_SERVICE_URL: http://catalog-service:8000
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./services/orders:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      catalog-service:
+        condition: service_started
+    networks:
+      - knife-store-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Payment Service - Микросервис платежей
+  payment-service:
+    build:
+      context: ./services/payments
+      dockerfile: Dockerfile
+    container_name: knife-store-payments
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/knife_store
+      REDIS_URL: redis://redis:6379/2
+      YUKASSA_SHOP_ID: ${YUKASSA_SHOP_ID}
+      YUKASSA_SECRET_KEY: ${YUKASSA_SECRET_KEY}
+      ORDER_SERVICE_URL: http://order-service:8000
+    ports:
+      - "8003:8000"
+    volumes:
+      - ./services/payments:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - knife-store-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Notification Service - Микросервис уведомлений
+  notification-service:
+    build:
+      context: ./services/notifications
+      dockerfile: Dockerfile
+    container_name: knife-store-notifications
+    environment:
+      REDIS_URL: redis://redis:6379/3
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    ports:
+      - "8004:8000"
+    volumes:
+      - ./services/notifications:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - knife-store-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker - Асинхронные задачи
+  celery-worker:
+    build:
+      context: ./services/notifications
+      dockerfile: Dockerfile
+    container_name: knife-store-celery-worker
+    environment:
+      REDIS_URL: redis://redis:6379/3
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    volumes:
+      - ./services/notifications:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - knife-store-network
+    command: celery -A app.celery_app worker --loglevel=info
+
+  # Admin Panel - Django админ-панель
+  admin-panel:
+    build:
+      context: ./services/admin
+      dockerfile: Dockerfile
+    container_name: knife-store-admin
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/knife_store
+      REDIS_URL: redis://redis:6379/4
+      SECRET_KEY: ${DJANGO_SECRET_KEY:-your-secret-key-change-in-production}
+      DEBUG: ${DEBUG:-True}
+      CATALOG_SERVICE_URL: http://catalog-service:8000
+      ORDER_SERVICE_URL: http://order-service:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./services/admin:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - knife-store-network
+    command: python manage.py runserver 0.0.0.0:8000
+
+  # Frontend - Next.js приложение
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: knife-store-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8001
+      NEXT_PUBLIC_ORDER_API_URL: http://localhost:8002
+      NEXT_PUBLIC_PAYMENT_API_URL: http://localhost:8003
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    networks:
+      - knife-store-network
+    command: npm run dev
+
+  # Prometheus - Мониторинг
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: knife-store-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - knife-store-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Grafana - Визуализация метрик
+  grafana:
+    image: grafana/grafana:latest
+    container_name: knife-store-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./infrastructure/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - knife-store-network
+    depends_on:
+      - prometheus
+
+networks:
+  knife-store-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
