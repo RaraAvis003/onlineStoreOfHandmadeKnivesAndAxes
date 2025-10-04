@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL - Основная база данных
   postgres:
@@ -241,8 +239,8 @@ services:
     networks:
       - knife-store-network
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
 
   # Grafana - Визуализация метрик
   grafana:
